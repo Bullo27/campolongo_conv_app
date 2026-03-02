@@ -2,10 +2,10 @@ package com.campolongo.convtimer.audio
 
 import android.content.Context
 import android.util.Log
-import com.konovalov.vad.silero.config.Mode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
@@ -22,6 +22,7 @@ class AudioPipeline(
     companion object {
         private const val TAG = "AudioPipeline"
         private const val SPEECH_SEGMENT_FRAMES = 5 // ~160ms of speech before speaker ID
+        private const val MFCC_COEFFS = 13
     }
 
     private val audioCapture = AudioCaptureService()
@@ -51,29 +52,24 @@ class AudioPipeline(
 
     /**
      * Calibrate noise level by capturing ambient audio for ~1.5 seconds.
-     * Call this before starting recording.
+     * Reuses the main AudioCaptureService to avoid device-specific issues
+     * with concurrent AudioRecord instances.
      */
     suspend fun calibrateNoise(context: Context): NoiseLevel {
-        val calibrationCapture = AudioCaptureService()
-        if (!calibrationCapture.initialize(context)) {
-            return NoiseLevel.QUIET
-        }
-
         val frames = mutableListOf<ShortArray>()
         val collectJob = scope.launch(Dispatchers.IO) {
-            calibrationCapture.frames.collect { frame ->
+            audioCapture.frames.collect { frame ->
                 frames.add(frame)
             }
         }
 
-        // Capture for ~1.5 seconds
-        val captureJob = scope.launch(Dispatchers.IO) {
-            calibrationCapture.startCapturing()
+        val capJob = scope.launch(Dispatchers.IO) {
+            audioCapture.startCapturing()
         }
 
-        kotlinx.coroutines.delay(1500)
-        calibrationCapture.close()
-        captureJob.cancel()
+        delay(1500)
+        audioCapture.pauseCapturing()
+        capJob.join()
         collectJob.cancel()
 
         noiseLevel = noiseCalibrator.calibrate(frames)
@@ -94,31 +90,27 @@ class AudioPipeline(
     }
 
     fun start() {
-        speechBuffer.clear()
         speakerIdentifier.reset()
-
-        captureJob = scope.launch(Dispatchers.IO) {
-            audioCapture.startCapturing()
-        }
-
-        processingJob = scope.launch(Dispatchers.IO) {
-            audioCapture.frames.collect { frame ->
-                processFrame(frame)
-            }
-        }
-
+        launchPipelineJobs()
         Log.d(TAG, "Pipeline started")
     }
 
     fun pause() {
-        captureJob?.cancel()
-        processingJob?.cancel()
-        audioCapture.pauseCapturing()
-        speechBuffer.clear()
+        stopPipelineJobs()
         Log.d(TAG, "Pipeline paused")
     }
 
-    fun resume(context: Context) {
+    fun resume() {
+        launchPipelineJobs()
+        Log.d(TAG, "Pipeline resumed")
+    }
+
+    fun stop() {
+        stopPipelineJobs()
+        Log.d(TAG, "Pipeline stopped")
+    }
+
+    private fun launchPipelineJobs() {
         speechBuffer.clear()
 
         captureJob = scope.launch(Dispatchers.IO) {
@@ -130,16 +122,14 @@ class AudioPipeline(
                 processFrame(frame)
             }
         }
-
-        Log.d(TAG, "Pipeline resumed")
     }
 
-    fun stop() {
+    private fun stopPipelineJobs() {
         captureJob?.cancel()
         processingJob?.cancel()
         audioCapture.pauseCapturing()
-        speechBuffer.clear()
-        Log.d(TAG, "Pipeline stopped")
+        // Don't clear speechBuffer here — avoids race with IO thread.
+        // It is cleared in launchPipelineJobs() before restarting.
     }
 
     private suspend fun processFrame(frame: ShortArray) {
@@ -161,19 +151,24 @@ class AudioPipeline(
     }
 
     private suspend fun identifyAndEmit() {
-        // Concatenate buffered frames
-        val totalSamples = speechBuffer.sumOf { it.size }
-        val segment = ShortArray(totalSamples)
-        var offset = 0
+        // Compute MFCCs per frame and average — uses all buffered audio
+        val avgMfcc = FloatArray(MFCC_COEFFS)
         for (frame in speechBuffer) {
-            frame.copyInto(segment, offset)
-            offset += frame.size
+            val frameMfcc = mfccExtractor.extract(frame)
+            for (i in avgMfcc.indices) {
+                avgMfcc[i] += frameMfcc[i]
+            }
         }
+        val count = speechBuffer.size
         speechBuffer.clear()
 
-        // Extract MFCC and identify speaker
-        val mfcc = mfccExtractor.extract(segment)
-        val speaker = speakerIdentifier.identify(mfcc)
+        if (count > 0) {
+            for (i in avgMfcc.indices) {
+                avgMfcc[i] /= count
+            }
+        }
+
+        val speaker = speakerIdentifier.identify(avgMfcc)
         _events.emit(AudioPipelineEvent.SpeechDetected(speaker))
     }
 

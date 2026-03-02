@@ -1,7 +1,5 @@
 package com.campolongo.convtimer.state
 
-import java.util.concurrent.atomic.AtomicLong
-
 data class MetricsSnapshot(
     val trt: Long = 0L,
     val wta: Long = 0L,
@@ -17,36 +15,40 @@ data class MetricsSnapshot(
     val bfst: Long get() = trt - tct
 }
 
+/**
+ * Accumulates conversation timing metrics.
+ * All access must be from a single thread (Dispatchers.Main via viewModelScope).
+ */
 class MetricsAccumulator {
-    private val _trt = AtomicLong(0L)
-    private val _wta = AtomicLong(0L)
-    private val _wtb = AtomicLong(0L)
-    private val _sta = AtomicLong(0L)
-    private val _stb = AtomicLong(0L)
-    private val _stm = AtomicLong(0L)
+    private var _trt = 0L
+    private var _wta = 0L
+    private var _wtb = 0L
+    private var _sta = 0L
+    private var _stb = 0L
+    private var _stm = 0L
 
-    fun addTrt(dt: Long) { _trt.addAndGet(dt) }
-    fun addWta(dt: Long) { _wta.addAndGet(dt) }
-    fun addWtb(dt: Long) { _wtb.addAndGet(dt) }
-    fun addSta(dt: Long) { _sta.addAndGet(dt) }
-    fun addStb(dt: Long) { _stb.addAndGet(dt) }
-    fun addStm(dt: Long) { _stm.addAndGet(dt) }
+    fun addTrt(dt: Long) { _trt += dt }
+    fun addWta(dt: Long) { _wta += dt }
+    fun addWtb(dt: Long) { _wtb += dt }
+    fun addSta(dt: Long) { _sta += dt }
+    fun addStb(dt: Long) { _stb += dt }
+    fun addStm(dt: Long) { _stm += dt }
 
     fun snapshot(): MetricsSnapshot = MetricsSnapshot(
-        trt = _trt.get(),
-        wta = _wta.get(),
-        wtb = _wtb.get(),
-        sta = _sta.get(),
-        stb = _stb.get(),
-        stm = _stm.get(),
+        trt = _trt,
+        wta = _wta,
+        wtb = _wtb,
+        sta = _sta,
+        stb = _stb,
+        stm = _stm,
     )
 
     fun reset() {
-        _trt.set(0L)
-        _wta.set(0L)
-        _wtb.set(0L)
-        _sta.set(0L)
-        _stb.set(0L)
-        _stm.set(0L)
+        _trt = 0L
+        _wta = 0L
+        _wtb = 0L
+        _sta = 0L
+        _stb = 0L
+        _stm = 0L
     }
 }

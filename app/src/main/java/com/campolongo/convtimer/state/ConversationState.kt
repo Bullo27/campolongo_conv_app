@@ -68,9 +68,9 @@ class ConversationStateMachine {
 
     fun onStop() {
         if (state != ConvState.IDLE && state != ConvState.STOPPED) {
-            // Resolve any pending silence as BFST (final silence)
-            // BFST is derived as TRT - TCT, so pending silence just stays unresolved
-            // (it's already counted in TRT but not in any conversation metric)
+            // Pending silence is left unresolved — it's already counted in TRT
+            // but not in any conversation metric, so it falls into BFST (= TRT - TCT)
+            // as final silence, which is the correct semantic.
             pendingSilenceMs = 0L
             pendingSilenceLastSpeaker = null
             state = ConvState.STOPPED

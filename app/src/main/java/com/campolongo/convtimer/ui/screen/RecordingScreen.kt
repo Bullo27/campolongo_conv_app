@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.campolongo.convtimer.audio.NoiseLevel
+import com.campolongo.convtimer.ui.theme.PauseOrange
 import com.campolongo.convtimer.ui.component.ControlButtons
 import com.campolongo.convtimer.ui.component.MetricsGrid
 import com.campolongo.convtimer.ui.component.MicrophoneIcon
@@ -86,7 +87,7 @@ fun RecordingScreen(viewModel: RecordingViewModel = viewModel()) {
                 Text(
                     text = "Calibrating noise level...",
                     fontSize = 16.sp,
-                    color = com.campolongo.convtimer.ui.theme.PauseOrange
+                    color = PauseOrange
                 )
             } else {
                 RecordingTimeDisplay(trtMs = uiState.metrics.trt)

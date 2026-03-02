@@ -82,10 +82,6 @@ class AudioCaptureService : Closeable {
         Log.d(TAG, "Paused capturing")
     }
 
-    fun resumeCapturing() {
-        // Will be restarted via startCapturing() coroutine
-    }
-
     override fun close() {
         isCapturing = false
         audioRecord?.stop()

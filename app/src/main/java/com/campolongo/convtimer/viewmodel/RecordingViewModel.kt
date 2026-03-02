@@ -1,6 +1,7 @@
 package com.campolongo.convtimer.viewmodel
 
 import android.app.Application
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -89,6 +90,7 @@ class RecordingViewModel(application: Application) : AndroidViewModel(applicatio
         pipeline.pause()
         stopTimeTick()
         stopEventCollection()
+        stopUiUpdates()
         _uiState.value = _uiState.value.copy(
             recordingState = RecordingState.PAUSED,
             metrics = stateMachine.snapshot()
@@ -96,11 +98,11 @@ class RecordingViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun onResume() {
-        val context = getApplication<Application>()
         stateMachine.onResume()
-        pipeline.resume(context)
+        pipeline.resume()
         startEventCollection()
         startTimeTick()
+        startUiUpdates()
         _uiState.value = _uiState.value.copy(recordingState = RecordingState.RECORDING)
     }
 
@@ -147,9 +149,13 @@ class RecordingViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun startTimeTick() {
         tickJob = viewModelScope.launch {
+            var lastTick = SystemClock.elapsedRealtime()
             while (true) {
                 delay(TICK_INTERVAL_MS)
-                stateMachine.onTimeTick(TICK_INTERVAL_MS)
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - lastTick
+                lastTick = now
+                stateMachine.onTimeTick(elapsed)
             }
         }
     }
@@ -163,7 +169,11 @@ class RecordingViewModel(application: Application) : AndroidViewModel(applicatio
         uiUpdateJob = viewModelScope.launch {
             while (true) {
                 delay(UI_UPDATE_INTERVAL_MS)
-                _uiState.value = _uiState.value.copy(metrics = stateMachine.snapshot())
+                val newMetrics = stateMachine.snapshot()
+                val current = _uiState.value
+                if (newMetrics != current.metrics) {
+                    _uiState.value = current.copy(metrics = newMetrics)
+                }
             }
         }
     }

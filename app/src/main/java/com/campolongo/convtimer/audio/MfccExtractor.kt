@@ -1,7 +1,6 @@
 package com.campolongo.convtimer.audio
 
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.ln
@@ -12,7 +11,9 @@ import kotlin.math.sqrt
 
 /**
  * Pure-Kotlin MFCC feature extraction.
- * Extracts 13 MFCC coefficients from a short audio segment.
+ * Extracts 13 MFCC coefficients from a short audio frame.
+ *
+ * NOT thread-safe — pre-allocated buffers are reused across calls.
  */
 class MfccExtractor(
     private val sampleRate: Int = 16000,
@@ -20,67 +21,98 @@ class MfccExtractor(
     private val numFilters: Int = 26,
     private val fftSize: Int = 512,
 ) {
+    // Pre-computed constant tables
     private val melFilterbank: Array<FloatArray> = createMelFilterbank()
-
-    fun extract(samples: ShortArray): FloatArray {
-        // Convert to float and apply pre-emphasis
-        val signal = FloatArray(samples.size)
-        signal[0] = samples[0].toFloat()
-        for (i in 1 until samples.size) {
-            signal[i] = samples[i].toFloat() - 0.97f * samples[i - 1].toFloat()
+    private val hammingWindow: FloatArray = FloatArray(fftSize) {
+        (0.54 - 0.46 * cos(2.0 * PI * it / (fftSize - 1))).toFloat()
+    }
+    private val twiddleReal: List<FloatArray>
+    private val twiddleImag: List<FloatArray>
+    private val dctBasis: Array<FloatArray> = Array(numCoeffs) { i ->
+        FloatArray(numFilters) { j ->
+            cos(PI * i * (j + 0.5) / numFilters).toFloat()
         }
-
-        // Take center portion or pad to fftSize
-        val frame = FloatArray(fftSize)
-        val copyLen = minOf(signal.size, fftSize)
-        val offset = maxOf(0, (signal.size - fftSize) / 2)
-        for (i in 0 until copyLen) {
-            frame[i] = signal[offset + i]
-        }
-
-        // Apply Hamming window
-        for (i in frame.indices) {
-            frame[i] *= (0.54f - 0.46f * cos(2.0 * PI * i / (fftSize - 1)).toFloat())
-        }
-
-        // Compute FFT and power spectrum
-        val powerSpectrum = computePowerSpectrum(frame)
-
-        // Apply Mel filterbank
-        val melEnergies = FloatArray(numFilters)
-        for (i in 0 until numFilters) {
-            var sum = 0f
-            for (j in powerSpectrum.indices) {
-                sum += melFilterbank[i][j] * powerSpectrum[j]
-            }
-            melEnergies[i] = if (sum > 1e-10f) ln(sum.toDouble()).toFloat() else -23.0f // ln(1e-10)
-        }
-
-        // Apply DCT to get MFCCs
-        val mfcc = FloatArray(numCoeffs)
-        for (i in 0 until numCoeffs) {
-            var sum = 0f
-            for (j in 0 until numFilters) {
-                sum += melEnergies[j] * cos(PI * i * (j + 0.5) / numFilters).toFloat()
-            }
-            mfcc[i] = sum
-        }
-
-        return mfcc
     }
 
-    private fun computePowerSpectrum(frame: FloatArray): FloatArray {
-        // Radix-2 Cooley-Tukey FFT
-        val n = frame.size
-        val real = frame.copyOf()
-        val imag = FloatArray(n)
+    // Pre-allocated working buffers (reused across calls)
+    private val frame = FloatArray(fftSize)
+    private val fftReal = FloatArray(fftSize)
+    private val fftImag = FloatArray(fftSize)
+    private val powerBuf = FloatArray(fftSize / 2 + 1)
+    private val melEnergies = FloatArray(numFilters)
+    private val mfccBuf = FloatArray(numCoeffs)
+
+    init {
+        val reals = mutableListOf<FloatArray>()
+        val imags = mutableListOf<FloatArray>()
+        var step = 1
+        while (step < fftSize) {
+            val angleStep = -PI / step
+            val r = FloatArray(step)
+            val im = FloatArray(step)
+            for (pair in 0 until step) {
+                val angle = angleStep * pair
+                r[pair] = cos(angle).toFloat()
+                im[pair] = sin(angle).toFloat()
+            }
+            reals.add(r)
+            imags.add(im)
+            step *= 2
+        }
+        twiddleReal = reals
+        twiddleImag = imags
+    }
+
+    fun extract(samples: ShortArray): FloatArray {
+        val copyLen = minOf(samples.size, fftSize)
+
+        // Pre-emphasis + Hamming window into frame buffer
+        frame[0] = samples[0].toFloat() * hammingWindow[0]
+        for (i in 1 until copyLen) {
+            frame[i] = (samples[i].toFloat() - 0.97f * samples[i - 1].toFloat()) * hammingWindow[i]
+        }
+        for (i in copyLen until fftSize) {
+            frame[i] = 0f
+        }
+
+        // FFT → power spectrum
+        computePowerSpectrum()
+
+        // Apply Mel filterbank
+        val specSize = powerBuf.size
+        for (i in 0 until numFilters) {
+            var sum = 0f
+            val filter = melFilterbank[i]
+            for (j in 0 until specSize) {
+                sum += filter[j] * powerBuf[j]
+            }
+            melEnergies[i] = if (sum > 1e-10f) ln(sum.toDouble()).toFloat() else -23.0f
+        }
+
+        // DCT using pre-computed basis
+        for (i in 0 until numCoeffs) {
+            var sum = 0f
+            val basis = dctBasis[i]
+            for (j in 0 until numFilters) {
+                sum += melEnergies[j] * basis[j]
+            }
+            mfccBuf[i] = sum
+        }
+
+        return mfccBuf.copyOf()
+    }
+
+    private fun computePowerSpectrum() {
+        frame.copyInto(fftReal)
+        fftImag.fill(0f)
 
         // Bit-reversal permutation
+        val n = fftSize
         var j = 0
         for (i in 0 until n - 1) {
             if (i < j) {
-                val tempR = real[i]; real[i] = real[j]; real[j] = tempR
-                val tempI = imag[i]; imag[i] = imag[j]; imag[j] = tempI
+                val tempR = fftReal[i]; fftReal[i] = fftReal[j]; fftReal[j] = tempR
+                val tempI = fftImag[i]; fftImag[i] = fftImag[j]; fftImag[j] = tempI
             }
             var k = n / 2
             while (k <= j) {
@@ -90,35 +122,33 @@ class MfccExtractor(
             j += k
         }
 
-        // FFT butterfly
+        // FFT butterfly with pre-computed twiddle factors
         var step = 1
+        var stageIdx = 0
         while (step < n) {
-            val angleStep = -PI / step
+            val wr = twiddleReal[stageIdx]
+            val wi = twiddleImag[stageIdx]
             for (group in 0 until n step step * 2) {
                 for (pair in 0 until step) {
-                    val angle = angleStep * pair
-                    val wr = cos(angle).toFloat()
-                    val wi = sin(angle).toFloat()
                     val idx1 = group + pair
                     val idx2 = idx1 + step
-                    val tr = wr * real[idx2] - wi * imag[idx2]
-                    val ti = wr * imag[idx2] + wi * real[idx2]
-                    real[idx2] = real[idx1] - tr
-                    imag[idx2] = imag[idx1] - ti
-                    real[idx1] += tr
-                    imag[idx1] += ti
+                    val tr = wr[pair] * fftReal[idx2] - wi[pair] * fftImag[idx2]
+                    val ti = wr[pair] * fftImag[idx2] + wi[pair] * fftReal[idx2]
+                    fftReal[idx2] = fftReal[idx1] - tr
+                    fftImag[idx2] = fftImag[idx1] - ti
+                    fftReal[idx1] += tr
+                    fftImag[idx1] += ti
                 }
             }
             step *= 2
+            stageIdx++
         }
 
-        // Power spectrum (only first half + 1)
+        // Power spectrum (first half + 1)
         val specSize = n / 2 + 1
-        val power = FloatArray(specSize)
         for (i in 0 until specSize) {
-            power[i] = (real[i] * real[i] + imag[i] * imag[i]) / n
+            powerBuf[i] = (fftReal[i] * fftReal[i] + fftImag[i] * fftImag[i]) / n
         }
-        return power
     }
 
     private fun createMelFilterbank(): Array<FloatArray> {
@@ -126,20 +156,17 @@ class MfccExtractor(
         val lowMel = hzToMel(0f)
         val highMel = hzToMel(sampleRate / 2f)
 
-        // Create equally spaced points in Mel scale
         val melPoints = FloatArray(numFilters + 2)
         for (i in melPoints.indices) {
             melPoints[i] = lowMel + i * (highMel - lowMel) / (numFilters + 1)
         }
 
-        // Convert back to Hz and then to FFT bin indices
         val binPoints = IntArray(melPoints.size)
         for (i in melPoints.indices) {
             val hz = melToHz(melPoints[i])
             binPoints[i] = floor(hz * (fftSize + 1) / sampleRate).toInt()
         }
 
-        // Create triangular filters
         val filterbank = Array(numFilters) { FloatArray(specSize) }
         for (i in 0 until numFilters) {
             for (j in binPoints[i] until binPoints[i + 1]) {

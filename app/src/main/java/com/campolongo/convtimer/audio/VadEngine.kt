@@ -29,13 +29,6 @@ class VadEngine : Closeable {
         Log.d(TAG, "VAD initialized with mode: $mode")
     }
 
-    fun setMode(mode: Mode) {
-        // VadSilero doesn't support changing mode after creation,
-        // but we can access the internal threshold. For now, we'll
-        // just log it - a full re-initialization would be needed.
-        Log.d(TAG, "Mode change requested: $mode (requires re-init)")
-    }
-
     fun isSpeech(frame: ShortArray): Boolean {
         return vad?.isSpeech(frame) ?: false
     }

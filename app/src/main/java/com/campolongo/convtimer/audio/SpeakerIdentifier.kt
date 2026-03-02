@@ -92,7 +92,7 @@ class SpeakerIdentifier(
             normA += a[i] * a[i]
             normB += b[i] * b[i]
         }
-        val denom = sqrt(normA) * sqrt(normB)
+        val denom = sqrt(normA * normB)
         return if (denom > 0f) dot / denom else 0f
     }
 }

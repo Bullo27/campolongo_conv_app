@@ -168,7 +168,10 @@ class AudioPipeline(
             }
         }
 
-        val speaker = speakerIdentifier.identify(avgMfcc)
+        // Drop C0 (log energy) — it dominates cosine similarity and
+        // masks the spectral-shape coefficients that distinguish speakers.
+        val embedding = avgMfcc.copyOfRange(1, MFCC_COEFFS)
+        val speaker = speakerIdentifier.identify(embedding)
         _events.emit(AudioPipelineEvent.SpeechDetected(speaker))
     }
 

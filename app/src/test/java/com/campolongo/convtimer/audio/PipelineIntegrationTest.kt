@@ -31,7 +31,7 @@ class PipelineIntegrationTest {
         private const val SAMPLE_RATE = 16000
         private const val FRAME_SIZE = 512
         private const val FRAME_MS = 32L // 512 / 16000 = 32ms
-        private const val SPEECH_SEGMENT_FRAMES = 5 // matches AudioPipeline
+        private const val SPEECH_SEGMENT_FRAMES = 5 // test uses 5 for predictable timing (app uses 8)
         private const val MFCC_COEFFS = 13
         private const val AMPLITUDE = 16000.0
     }

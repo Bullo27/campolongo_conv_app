@@ -6,11 +6,16 @@ import kotlin.math.sqrt
 /**
  * Identifies speakers by comparing MFCC embeddings via cosine similarity.
  * First speaker detected = Speaker A; a distinct new voice = Speaker B.
+ *
+ * B confirmation: requires [bConfirmFrames] consecutive below-threshold decisions
+ * before establishing Speaker B's reference. Prevents single noisy frames from
+ * creating a false Speaker B.
  */
 class SpeakerIdentifier(
     private val similarityThreshold: Float = 0.80f,
-    private val ambiguityMargin: Float = 0.10f, // hysteresis zone: threshold +/- margin
-    private val emaAlpha: Float = 0.1f, // exponential moving average update rate
+    private val ambiguityMargin: Float = 0.10f,
+    private val emaAlpha: Float = 0.1f,
+    private val bConfirmFrames: Int = 2,
 ) {
     companion object {
         private const val TAG = "SpeakerID"
@@ -20,10 +25,13 @@ class SpeakerIdentifier(
     private var speakerBRef: FloatArray? = null
     private var lastSpeaker: Speaker? = null
 
+    // B confirmation state
+    private var bCandidateCount = 0
+    private var bCandidateMfcc: FloatArray? = null
+
     fun identify(mfcc: FloatArray): Speaker {
         val refA = speakerARef
         if (refA == null) {
-            // First speech ever — this is Speaker A
             speakerARef = mfcc.copyOf()
             lastSpeaker = Speaker.A
             Log.d(TAG, "Speaker A reference established")
@@ -34,18 +42,41 @@ class SpeakerIdentifier(
         val refB = speakerBRef
 
         if (refB == null) {
-            // Speaker B not yet established
             if (simA >= similarityThreshold) {
-                // Still Speaker A
+                // Still Speaker A — reset B candidate streak
+                bCandidateCount = 0
+                bCandidateMfcc = null
                 updateReference(Speaker.A, mfcc)
                 lastSpeaker = Speaker.A
                 return Speaker.A
             } else {
-                // New speaker detected — this is Speaker B
-                speakerBRef = mfcc.copyOf()
-                lastSpeaker = Speaker.B
-                Log.d(TAG, "Speaker B reference established (simA=%.3f)".format(simA))
-                return Speaker.B
+                // Below threshold — candidate B frame
+                bCandidateCount++
+                val candidateAcc = bCandidateMfcc
+                if (candidateAcc == null) {
+                    bCandidateMfcc = mfcc.copyOf()
+                } else {
+                    for (i in candidateAcc.indices) {
+                        candidateAcc[i] += mfcc[i]
+                    }
+                }
+                if (bCandidateCount >= bConfirmFrames) {
+                    // Confirmed B — establish from averaged candidate MFCCs
+                    val avg = bCandidateMfcc!!
+                    for (i in avg.indices) {
+                        avg[i] /= bCandidateCount
+                    }
+                    speakerBRef = avg
+                    bCandidateCount = 0
+                    bCandidateMfcc = null
+                    lastSpeaker = Speaker.B
+                    Log.d(TAG, "Speaker B confirmed after $bConfirmFrames frames (simA=%.3f)".format(simA))
+                    return Speaker.B
+                }
+                // Not yet confirmed — return A as safe default
+                // Don't EMA-update ref_a with B-candidate speech (would contaminate A's reference)
+                lastSpeaker = Speaker.A
+                return Speaker.A
             }
         }
 
@@ -54,11 +85,8 @@ class SpeakerIdentifier(
         Log.v(TAG, "simA=%.3f, simB=%.3f".format(simA, simB))
 
         val speaker = when {
-            // Clear Speaker A
             simA > simB + ambiguityMargin -> Speaker.A
-            // Clear Speaker B
             simB > simA + ambiguityMargin -> Speaker.B
-            // Ambiguous — keep previous speaker (hysteresis)
             else -> lastSpeaker ?: Speaker.A
         }
 
@@ -71,12 +99,13 @@ class SpeakerIdentifier(
         speakerARef = null
         speakerBRef = null
         lastSpeaker = null
+        bCandidateCount = 0
+        bCandidateMfcc = null
     }
 
     private fun updateReference(speaker: Speaker, mfcc: FloatArray) {
         val ref = if (speaker == Speaker.A) speakerARef else speakerBRef
         if (ref != null) {
-            // EMA update
             for (i in ref.indices) {
                 ref[i] = (1 - emaAlpha) * ref[i] + emaAlpha * mfcc[i]
             }

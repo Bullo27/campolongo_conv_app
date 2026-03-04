@@ -31,7 +31,7 @@ class PipelineIntegrationTest {
         private const val SAMPLE_RATE = 16000
         private const val FRAME_SIZE = 512
         private const val FRAME_MS = 32L // 512 / 16000 = 32ms
-        private const val SPEECH_SEGMENT_FRAMES = 5 // matches AudioPipeline
+        private const val SPEECH_SEGMENT_FRAMES = 5 // test uses 5 for predictable timing (app uses 8)
         private const val MFCC_COEFFS = 13
         private const val AMPLITUDE = 16000.0
     }
@@ -179,15 +179,6 @@ class PipelineIntegrationTest {
     }
 
     // ===== Test 1: Single speaker, all speech =====
-    //
-    // 15 frames of speech, all Speaker A.
-    //
-    // Timeline (tick happens before event each frame):
-    //   Frames 1-5:   tick in INITIAL_SILENCE (only TRT). At 5: emit A → SPEAKER_A
-    //   Frames 6-10:  tick in SPEAKER_A → WTA += 32 each (=160). At 10: emit A.
-    //   Frames 11-15: tick in SPEAKER_A → WTA += 32 each (=320). At 15: emit A.
-    //
-    // identifyAndEmit called 3 times → 3 speaker decisions, all A.
 
     @Test
     fun singleSpeakerAllSpeech() {
@@ -204,20 +195,7 @@ class PipelineIntegrationTest {
         assertInvariant(snap)
     }
 
-    // ===== Test 2: Two speakers, direct switch (no silence between) =====
-    //
-    // 10 frames A, then 10 frames B, continuous speech.
-    //
-    // Timeline:
-    //   Frames 1-5:   INITIAL_SILENCE ticks. At 5: emit A → SPEAKER_A
-    //   Frames 6-10:  SPEAKER_A ticks → WTA=160. At 10: emit A.
-    //   Frames 11-15: SPEAKER_A ticks → WTA=320. At 15: emit B → SPEAKER_B (direct switch)
-    //   Frames 16-20: SPEAKER_B ticks → WTB=160. At 20: emit B.
-    //
-    // Note: frames 11-15 tick as SPEAKER_A because the state doesn't change
-    // until the buffer fills and speaker ID runs. This is the real app behavior.
-    //
-    // identifyAndEmit called 4 times: A, A, B, B.
+    // ===== Test 2: Two speakers, direct switch =====
 
     @Test
     fun twoSpeakersDirectSwitch() {
@@ -234,20 +212,7 @@ class PipelineIntegrationTest {
         assertInvariant(snap)
     }
 
-    // ===== Test 3: Speaker A → silence → Speaker A (within-speaker silence = STA) =====
-    //
-    // 10 frames A speech, 5 frames silence, 10 frames A speech.
-    //
-    // Timeline:
-    //   Frames 1-5:   INITIAL_SILENCE. At 5: emit A → SPEAKER_A.
-    //   Frames 6-10:  SPEAKER_A → WTA=160. At 10: emit A.
-    //   Frame 11 (silence): tick SPEAKER_A → WTA=192. onSilenceDetected → PENDING(prev=A).
-    //   Frames 12-15 (silence): tick PENDING → pending=32,64,96,128.
-    //   Frames 16-20 (speech A): tick PENDING → pending=160..288. At 20: emit A.
-    //     resolvePendingSilence(A): prev=A, next=A → STA=288. → SPEAKER_A.
-    //   Frames 21-25 (speech A): tick SPEAKER_A → WTA=224..352. At 25: emit A.
-    //
-    // identifyAndEmit called 4 times: A, A, A, A.
+    // ===== Test 3: Within-speaker silence (STA) =====
 
     @Test
     fun withinSpeakerSilenceSta() {
@@ -266,20 +231,7 @@ class PipelineIntegrationTest {
         assertInvariant(snap)
     }
 
-    // ===== Test 4: Speaker A → silence → Speaker B (between-speaker silence = STM) =====
-    //
-    // 10 frames A speech, 5 frames silence, 10 frames B speech.
-    //
-    // Timeline:
-    //   Frames 1-5:   INITIAL_SILENCE. At 5: emit A → SPEAKER_A.
-    //   Frames 6-10:  SPEAKER_A → WTA=160. At 10: emit A.
-    //   Frame 11 (silence): tick SPEAKER_A → WTA=192. onSilenceDetected → PENDING(prev=A).
-    //   Frames 12-15 (silence): PENDING → pending=32,64,96,128.
-    //   Frames 16-20 (speech B): PENDING → pending=160..288. At 20: emit B.
-    //     resolvePendingSilence(B): prev=A, next=B → STM=288. → SPEAKER_B.
-    //   Frames 21-25 (speech B): SPEAKER_B → WTB=160. At 25: emit B.
-    //
-    // identifyAndEmit called 4 times: A, A, B, B.
+    // ===== Test 4: Between-speaker silence (STM) =====
 
     @Test
     fun betweenSpeakerSilenceStm() {
@@ -298,16 +250,7 @@ class PipelineIntegrationTest {
         assertInvariant(snap)
     }
 
-    // ===== Test 5: Initial silence → speech (BFST calculation) =====
-    //
-    // 10 frames silence, then 10 frames A speech.
-    //
-    // Timeline:
-    //   Frames 1-10 (silence): tick INITIAL_SILENCE (only TRT). onSilenceDetected (no-op).
-    //   Frames 11-15 (speech A): tick INITIAL_SILENCE (only TRT). At 15: emit A → SPEAKER_A.
-    //   Frames 16-20 (speech A): tick SPEAKER_A → WTA=160. At 20: emit A.
-    //
-    // identifyAndEmit called 2 times: A, A.
+    // ===== Test 5: Initial silence then speech =====
 
     @Test
     fun initialSilenceThenSpeech() {
@@ -324,40 +267,18 @@ class PipelineIntegrationTest {
     }
 
     // ===== Test 6: Full conversation =====
-    //
-    // A talks (10), silence (5), B talks (10), silence (5), A talks (10), stop.
-    //
-    // Timeline:
-    //   Frames 1-5:   INITIAL_SILENCE. At 5: emit A → SPEAKER_A.
-    //   Frames 6-10:  SPEAKER_A → WTA=160. At 10: emit A.
-    //   Frame 11 (silence): tick SPEAKER_A → WTA=192. Silence → PENDING(prev=A).
-    //   Frames 12-15 (silence): PENDING → pending=32,64,96,128.
-    //   Frames 16-20 (speech B): PENDING → pending=160..288. At 20: emit B. STM=288. → SPEAKER_B.
-    //   Frames 21-25 (speech B): SPEAKER_B → WTB=160. At 25: emit B.
-    //   Frame 26 (silence): tick SPEAKER_B → WTB=192. Silence → PENDING(prev=B).
-    //   Frames 27-30 (silence): PENDING → pending=32,64,96,128.
-    //   Frames 31-35 (speech A): PENDING → pending=160..288. At 35: emit A.
-    //     prev=B, next=A → STM+=288 (total STM=576). → SPEAKER_A.
-    //   Frames 36-40 (speech A): SPEAKER_A → WTA=192+160=352. At 40: emit A.
-    //
-    // identifyAndEmit called 8 times: A, A, B, B, A, A — wait, let me count.
-    // Frames 1-5 → emit (1). Frames 6-10 → emit (2). Frames 16-20 → emit (3).
-    // Frames 21-25 → emit (4). Frames 31-35 → emit (5). Frames 36-40 → emit (6).
-    // But also: frame 11 is silence, buffer was cleared at emit(2). Buffer empty, <2, no flush.
-    // Frame 26 is silence, buffer was cleared at emit(4). Buffer empty, <2, no flush.
-    // So 6 emits total.
 
     @Test
     fun fullConversation() {
-        val frames = speechFrames(200.0, 10) +                           // A talks
-                silenceFrames(5) +                                        // silence
-                speechFrames(2000.0, 10, startIndex = 15) +              // B talks
-                silenceFrames(5) +                                        // silence
-                speechFrames(200.0, 10, startIndex = 30)                 // A talks
+        val frames = speechFrames(200.0, 10) +
+                silenceFrames(5) +
+                speechFrames(2000.0, 10, startIndex = 15) +
+                silenceFrames(5) +
+                speechFrames(200.0, 10, startIndex = 30)
         val snap = runScenario(frames, listOf(
-            Speaker.A, Speaker.A,   // first A block (frames 1-10)
-            Speaker.B, Speaker.B,   // B block (frames 16-25)
-            Speaker.A, Speaker.A,   // second A block (frames 31-40)
+            Speaker.A, Speaker.A,
+            Speaker.B, Speaker.B,
+            Speaker.A, Speaker.A,
         ))
 
         assertEquals("TRT", 1280L, snap.trt)
@@ -368,7 +289,6 @@ class PipelineIntegrationTest {
         assertEquals("STM", 576L, snap.stm)
         assertEquals("BFST", 160L, snap.bfst)
 
-        // Derived metrics
         assertEquals("CTA = WTA + STA", 352L, snap.cta)
         assertEquals("CTB = WTB + STB", 192L, snap.ctb)
         assertEquals("TCT = CTA + STM + CTB", 1120L, snap.tct)
@@ -376,29 +296,23 @@ class PipelineIntegrationTest {
         assertInvariant(snap)
     }
 
-    // ===== Test 7: TRT = TCT + BFST invariant across multiple scenarios =====
+    // ===== Test 7: TRT invariant across scenarios =====
 
     @Test
     fun trtInvariantHoldsAcrossScenarios() {
         data class Scenario(val label: String, val frames: List<FrameSpec>, val speakers: List<Speaker>)
 
         val scenarios = listOf(
-            // Only silence — no identifyAndEmit calls
             Scenario("only silence", silenceFrames(20), emptyList()),
-            // Single speaker, speech only
             Scenario("single speaker",
                 speechFrames(200.0, 10),
                 listOf(Speaker.A, Speaker.A)),
-            // Alternating speech/silence with partial buffer flush
-            // 5 speech → emit(A). 3 silence (buffer empty, <2, no flush). 5 speech → emit(A). = 2 emits
             Scenario("alternating speech/silence",
                 speechFrames(200.0, 5) + silenceFrames(3) + speechFrames(200.0, 5, startIndex = 8),
                 listOf(Speaker.A, Speaker.A)),
-            // Long initial silence + short speech
             Scenario("long silence + speech",
                 silenceFrames(15) + speechFrames(200.0, 5, startIndex = 15),
                 listOf(Speaker.A)),
-            // Rapid speaker switching: A(5) B(5) A(5) = 3 emits
             Scenario("rapid switching",
                 speechFrames(200.0, 5) + speechFrames(2000.0, 5, startIndex = 5) + speechFrames(200.0, 5, startIndex = 10),
                 listOf(Speaker.A, Speaker.B, Speaker.A)),
@@ -414,17 +328,7 @@ class PipelineIntegrationTest {
         }
     }
 
-    // ===== Test 9: Partial buffer flush on silence =====
-    //
-    // 3 speech frames, then silence. Buffer has 3 frames (>= 2), so it flushes.
-    //
-    // Timeline:
-    //   Frames 1-3: INITIAL_SILENCE ticks. Speech, buffer=1,2,3.
-    //   Frame 4 (silence): tick INITIAL_SILENCE. Buffer=3 >= 2 → flush → emit A → SPEAKER_A.
-    //     Then silence → PENDING(prev=A).
-    //   Frame 5 (silence): tick PENDING → pending=32.
-    //
-    // identifyAndEmit called 1 time: A.
+    // ===== Test 9: Partial buffer flush =====
 
     @Test
     fun partialBufferFlushOnSilence() {
@@ -432,22 +336,11 @@ class PipelineIntegrationTest {
         val snap = runScenario(frames, listOf(Speaker.A))
 
         assertEquals("TRT", 160L, snap.trt)
-        // Frame 4 tick is in INITIAL_SILENCE (TRT only), then emit A → SPEAKER_A, then silence → PENDING.
-        // Frame 5 tick is in PENDING → pending=32.
-        // WTA = 0 (speech was detected at frame 4, but then immediately went to silence/PENDING)
         assertEquals("WTA", 0L, snap.wta)
         assertInvariant(snap)
     }
 
-    // ===== Test 10: Buffer too small, no flush on silence =====
-    //
-    // 1 speech frame, then silence. Buffer has 1 frame (< 2), no flush.
-    //
-    // Timeline:
-    //   Frame 1: INITIAL_SILENCE tick. Speech, buffer=1.
-    //   Frame 2 (silence): INITIAL_SILENCE tick. Buffer=1 < 2 → no flush. Clear. onSilenceDetected (no-op).
-    //
-    // identifyAndEmit never called → 0 speaker decisions needed.
+    // ===== Test 10: Buffer too small =====
 
     @Test
     fun noFlushWhenBufferTooSmall() {

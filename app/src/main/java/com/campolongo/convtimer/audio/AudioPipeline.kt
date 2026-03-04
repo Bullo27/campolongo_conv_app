@@ -21,8 +21,9 @@ class AudioPipeline(
 
     companion object {
         private const val TAG = "AudioPipeline"
-        private const val SPEECH_SEGMENT_FRAMES = 5 // ~160ms of speech before speaker ID
+        private const val SPEECH_SEGMENT_FRAMES = 8 // ~256ms of speech before speaker ID
         private const val MFCC_COEFFS = 13
+        private const val SMOOTHING_WINDOW = 6 // majority-vote over recent decisions
     }
 
     private val audioCapture = AudioCaptureService()
@@ -37,6 +38,10 @@ class AudioPipeline(
     private var captureJob: Job? = null
     private var processingJob: Job? = null
     private val speechBuffer = mutableListOf<ShortArray>()
+
+    // Smoothing: majority-vote over recent raw speaker decisions
+    private val decisionBuffer = ArrayDeque<Speaker>(SMOOTHING_WINDOW)
+    private var lastSmoothedSpeaker = Speaker.A
 
     var noiseLevel: NoiseLevel = NoiseLevel.QUIET
         private set
@@ -91,6 +96,8 @@ class AudioPipeline(
 
     fun start() {
         speakerIdentifier.reset()
+        decisionBuffer.clear()
+        lastSmoothedSpeaker = Speaker.A
         launchPipelineJobs()
         Log.d(TAG, "Pipeline started")
     }
@@ -171,8 +178,28 @@ class AudioPipeline(
         // Drop C0 (log energy) — it dominates cosine similarity and
         // masks the spectral-shape coefficients that distinguish speakers.
         val embedding = avgMfcc.copyOfRange(1, MFCC_COEFFS)
-        val speaker = speakerIdentifier.identify(embedding)
-        _events.emit(AudioPipelineEvent.SpeechDetected(speaker))
+        val rawSpeaker = speakerIdentifier.identify(embedding)
+
+        // Majority-vote smoothing over recent decisions
+        if (decisionBuffer.size >= SMOOTHING_WINDOW) {
+            decisionBuffer.removeFirst()
+        }
+        decisionBuffer.addLast(rawSpeaker)
+
+        val smoothed = if (SMOOTHING_WINDOW <= 1) {
+            rawSpeaker
+        } else {
+            val countA = decisionBuffer.count { it == Speaker.A }
+            val countB = decisionBuffer.size - countA
+            when {
+                countA > countB -> Speaker.A
+                countB > countA -> Speaker.B
+                else -> lastSmoothedSpeaker // tie → keep previous
+            }
+        }
+        lastSmoothedSpeaker = smoothed
+
+        _events.emit(AudioPipelineEvent.SpeechDetected(smoothed))
     }
 
     override fun close() {

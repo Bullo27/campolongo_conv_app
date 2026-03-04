@@ -40,20 +40,34 @@ class SpeakerIdentifierTest {
     @Test
     fun differentVectorEstablishesSpeakerB() {
         identifier.identify(vectorA) // establish A
+        // With bConfirmFrames=2, first below-threshold returns A (candidate)
+        assertEquals(Speaker.A, identifier.identify(vectorB))
+        // Second consecutive below-threshold confirms B
         assertEquals(Speaker.B, identifier.identify(vectorB))
+    }
+
+    @Test
+    fun singleBelowThresholdDoesNotEstablishB() {
+        identifier.identify(vectorA) // establish A
+        identifier.identify(vectorB) // 1st below-threshold → candidate, returns A
+        identifier.identify(vectorCloseToA) // back above threshold → resets candidate
+        // B should still not be established; vectorB again starts fresh candidate
+        assertEquals(Speaker.A, identifier.identify(vectorB))
     }
 
     @Test
     fun bothEstablishedClearA() {
         identifier.identify(vectorA) // establish A
-        identifier.identify(vectorB) // establish B
+        identifier.identify(vectorB) // 1st B candidate
+        identifier.identify(vectorB) // confirm B
         assertEquals(Speaker.A, identifier.identify(vectorCloseToA))
     }
 
     @Test
     fun bothEstablishedClearB() {
         identifier.identify(vectorA) // establish A
-        identifier.identify(vectorB) // establish B
+        identifier.identify(vectorB) // 1st B candidate
+        identifier.identify(vectorB) // confirm B
         // A vector very similar to B
         val closeToB = FloatArray(13) { if (it % 2 == 0) 0.05f else 1.0f }
         assertEquals(Speaker.B, identifier.identify(closeToB))
@@ -62,7 +76,8 @@ class SpeakerIdentifierTest {
     @Test
     fun ambiguousVectorKeepsLastSpeaker() {
         identifier.identify(vectorA) // establish A, lastSpeaker = A
-        identifier.identify(vectorB) // establish B, lastSpeaker = B
+        identifier.identify(vectorB) // 1st B candidate
+        identifier.identify(vectorB) // confirm B, lastSpeaker = B
 
         // Ambiguous: equal similarity to both → hysteresis keeps last (B)
         val result = identifier.identify(vectorAmbiguous)
@@ -72,7 +87,8 @@ class SpeakerIdentifierTest {
     @Test
     fun ambiguousAfterSpeakerAKeepsA() {
         identifier.identify(vectorA) // establish A, lastSpeaker = A
-        identifier.identify(vectorB) // establish B, lastSpeaker = B
+        identifier.identify(vectorB) // 1st B candidate
+        identifier.identify(vectorB) // confirm B, lastSpeaker = B
         identifier.identify(vectorCloseToA) // switch to A, lastSpeaker = A
 
         // Ambiguous → should keep A
@@ -97,7 +113,8 @@ class SpeakerIdentifierTest {
     @Test
     fun resetClearsAllState() {
         identifier.identify(vectorA)
-        identifier.identify(vectorB)
+        identifier.identify(vectorB) // 1st B candidate
+        identifier.identify(vectorB) // confirm B
         identifier.reset()
 
         // After reset, first call should establish new speaker A again
@@ -109,15 +126,18 @@ class SpeakerIdentifierTest {
         val zero = FloatArray(13) { 0.0f }
         // First call always returns A
         assertEquals(Speaker.A, identifier.identify(zero))
-        // cosine similarity with zero vector returns 0, which is < threshold → Speaker B
+        // cosine similarity with zero vector returns 0, which is < threshold → B candidate
         val nonZero = FloatArray(13) { 1.0f }
-        assertEquals(Speaker.B, identifier.identify(nonZero))
+        assertEquals(Speaker.A, identifier.identify(nonZero)) // 1st candidate, returns A
+        assertEquals(Speaker.B, identifier.identify(nonZero)) // 2nd → confirmed B
     }
 
     @Test
     fun customThresholds() {
-        // Very strict similarity threshold — even close vectors get classified as B
-        val strict = SpeakerIdentifier(similarityThreshold = 0.99f, ambiguityMargin = 0.01f)
+        // Very strict threshold + bConfirmFrames=1 for single-call B establishment
+        val strict = SpeakerIdentifier(
+            similarityThreshold = 0.99f, ambiguityMargin = 0.01f, bConfirmFrames = 1
+        )
         strict.identify(vectorA) // establish A
         val slightlyDifferent = FloatArray(13) { if (it % 2 == 0) 1.0f else 0.2f }
         // cosine similarity between vectorA and slightlyDifferent is < 0.99

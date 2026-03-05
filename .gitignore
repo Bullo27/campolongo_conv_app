@@ -24,3 +24,6 @@ test_audio/
 # Python cache
 __pycache__/
 *.pyc
+
+# ONNX model (too large for git)
+models/

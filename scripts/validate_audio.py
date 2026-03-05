@@ -61,6 +61,21 @@ DEFAULT_FEATURE_MODE = "static"
 DEFAULT_CMVN_WINDOW = 0   # 0 = off (backward compatible)
 N_DELTA = 2               # regression width for delta computation
 
+# Neural embedding settings (v2)
+ENGINE_CHOICES = ("mfcc", "neural")
+DEFAULT_ENGINE = "mfcc"
+NEURAL_SEGMENT_FRAMES = 47  # ~1.5s of speech at 32ms/frame before neural embedding
+NEURAL_SIM_THRESHOLD = 0.50  # initial guess — will be tuned via sweep
+NEURAL_AMBIGUITY_MARGIN = 0.10
+WESPEAKER_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "models", "voxceleb_ECAPA512_LM.onnx"
+)
+# Fbank config matching WeSpeaker training (config.yaml)
+FBANK_SAMPLE_RATE = 16000
+FBANK_FRAME_LENGTH_MS = 25   # 400 samples at 16kHz
+FBANK_FRAME_SHIFT_MS = 10    # 160 samples at 16kHz
+FBANK_NUM_MEL_BINS = 80
+
 
 # ──────────────────────────────────────────────────────────────────
 # Cepstral Mean Variance Normalization (CMVN)
@@ -178,6 +193,61 @@ class MfccExtractor:
 
 
 # ──────────────────────────────────────────────────────────────────
+# WeSpeaker Neural Embedding Extractor
+# ──────────────────────────────────────────────────────────────────
+
+class WeSpeakerEmbedder:
+    """Extract 192-dim speaker embeddings using WeSpeaker ECAPA-TDNN-512 ONNX model.
+
+    Preprocessing: 80-dim Fbank features (25ms frame, 10ms shift, 16kHz).
+    Uses torchaudio kaldi-compatible fbank for exact match with WeSpeaker training.
+    """
+
+    def __init__(self, model_path: str = WESPEAKER_MODEL_PATH):
+        import onnxruntime as ort
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"WeSpeaker ONNX model not found: {model_path}\n"
+                "Run: python3 scripts/install_wespeaker.py"
+            )
+        self.session = ort.InferenceSession(model_path)
+        self.input_name = self.session.get_inputs()[0].name
+
+    def extract_fbank(self, audio_int16: np.ndarray) -> np.ndarray:
+        """Extract 80-dim Fbank features from int16 audio. Returns [T, 80] array."""
+        import torch
+        import torchaudio
+
+        audio_f32 = torch.FloatTensor(audio_int16.astype(np.float32) / 32768.0).unsqueeze(0)
+        fbank = torchaudio.compliance.kaldi.fbank(
+            audio_f32,
+            sample_frequency=FBANK_SAMPLE_RATE,
+            frame_length=FBANK_FRAME_LENGTH_MS,
+            frame_shift=FBANK_FRAME_SHIFT_MS,
+            num_mel_bins=FBANK_NUM_MEL_BINS,
+            dither=0.0,
+            energy_floor=1.0,
+            window_type="hamming",
+        )
+        return fbank.numpy()  # [T, 80]
+
+    def extract_embedding(self, audio_int16: np.ndarray) -> np.ndarray:
+        """Extract 192-dim speaker embedding from int16 audio segment.
+
+        Args:
+            audio_int16: int16 audio samples (16kHz mono), any length
+
+        Returns:
+            192-dim float32 embedding vector
+        """
+        fbank = self.extract_fbank(audio_int16)  # [T, 80]
+        fbank_batch = fbank[np.newaxis, :, :]    # [1, T, 80]
+        outputs = self.session.run(None, {self.input_name: fbank_batch})
+        embedding = outputs[0][0]                 # [192]
+        return embedding
+
+
+# ──────────────────────────────────────────────────────────────────
 # Speaker Identification (matching SpeakerIdentifier.kt exactly)
 # ──────────────────────────────────────────────────────────────────
 
@@ -185,11 +255,13 @@ class SpeakerIdentifier:
     def __init__(self, threshold=SPEAKER_SIM_THRESHOLD,
                  margin=SPEAKER_AMBIGUITY_MARGIN,
                  ema_alpha=SPEAKER_EMA_ALPHA,
-                 b_confirm_frames: int = 2):
+                 b_confirm_frames: int = 2,
+                 min_frames_for_b: int = 0):
         self.threshold = threshold
         self.margin = margin
         self.ema_alpha = ema_alpha
         self.b_confirm_frames = max(1, b_confirm_frames)
+        self.min_frames_for_b = min_frames_for_b
         self.ref_a = None
         self.ref_b = None
         self.last_speaker = None
@@ -220,12 +292,19 @@ class SpeakerIdentifier:
         return float(dot / denom) if denom > 0 else 0.0
 
     def _update_ref(self, speaker, mfcc):
+        # Freeze both references once B is established — initial refs are cleanest
+        if self.ref_b is not None:
+            return
         ref = self.ref_a if speaker == "A" else self.ref_b
         if ref is not None:
             ref[:] = (1 - self.ema_alpha) * ref + self.ema_alpha * mfcc
 
-    def identify(self, mfcc: np.ndarray) -> str:
-        """Returns 'A' or 'B'. Also populates last_sim_a, last_sim_b, last_ambiguous."""
+    def identify(self, mfcc: np.ndarray, n_frames: int = 0) -> str:
+        """Returns 'A' or 'B'. Also populates last_sim_a, last_sim_b, last_ambiguous.
+
+        n_frames: number of raw audio frames in the segment (0 = unknown/legacy).
+        Only segments with n_frames >= min_frames_for_b can count toward B establishment.
+        """
         if self.ref_a is None:
             self.ref_a = mfcc.copy()
             self.last_speaker = "A"
@@ -248,23 +327,26 @@ class SpeakerIdentifier:
                 self.last_ambiguous = False
                 return "A"
             else:
-                # Below threshold — candidate B frame
-                self._b_candidate_count += 1
-                if self._b_candidate_mfcc is None:
-                    self._b_candidate_mfcc = mfcc.copy()
-                else:
-                    self._b_candidate_mfcc += mfcc
-                if self._b_candidate_count >= self.b_confirm_frames:
-                    # Confirmed B — establish from averaged candidate MFCCs
-                    self.ref_b = self._b_candidate_mfcc / self._b_candidate_count
-                    self._b_candidate_count = 0
-                    self._b_candidate_mfcc = None
-                    self.last_speaker = "B"
-                    self.last_sim_b = 1.0
-                    self.last_ambiguous = False
-                    return "B"
-                # Not yet confirmed — return A as safe default
-                # Don't EMA-update ref_a with B-candidate speech (would contaminate A's reference)
+                # Below threshold — potential B candidate
+                is_full_segment = (n_frames >= self.min_frames_for_b) if n_frames > 0 else True
+                if is_full_segment:
+                    # Full-length segment: count toward B confirmation
+                    self._b_candidate_count += 1
+                    if self._b_candidate_mfcc is None:
+                        self._b_candidate_mfcc = mfcc.copy()
+                    else:
+                        self._b_candidate_mfcc += mfcc
+                    if self._b_candidate_count >= self.b_confirm_frames:
+                        # Confirmed B — establish from averaged candidate embeddings
+                        self.ref_b = self._b_candidate_mfcc / self._b_candidate_count
+                        self._b_candidate_count = 0
+                        self._b_candidate_mfcc = None
+                        self.last_speaker = "B"
+                        self.last_sim_b = 1.0
+                        self.last_ambiguous = False
+                        return "B"
+                # Short/flush segment or not yet confirmed:
+                # Classify as A (safe default), no EMA update, no bconf increment
                 self.last_speaker = "A"
                 self.last_ambiguous = False
                 return "A"
@@ -418,21 +500,47 @@ class GroundTruthSpeakerOracle:
 
 
 class PipelineSimulator:
-    """Simulates the app's AudioPipeline: VAD → MFCC buffer → Speaker ID → State Machine."""
+    """Simulates the app's AudioPipeline: VAD → feature extraction → Speaker ID → State Machine.
+
+    Supports two engines:
+      - 'mfcc': Original MFCC-based speaker ID (v1)
+      - 'neural': WeSpeaker ECAPA-TDNN neural embeddings (v2)
+    """
 
     def __init__(self, vad_function, speaker_oracle: GroundTruthSpeakerOracle | None = None,
                  smoothing_window: int = DEFAULT_SMOOTHING_WINDOW,
                  speech_segment_frames: int = SPEECH_SEGMENT_FRAMES,
                  b_confirm_frames: int = DEFAULT_B_CONFIRM_FRAMES,
                  feature_mode: str = DEFAULT_FEATURE_MODE,
-                 cmvn_window: int = DEFAULT_CMVN_WINDOW):
+                 cmvn_window: int = DEFAULT_CMVN_WINDOW,
+                 engine: str = DEFAULT_ENGINE,
+                 sim_threshold: float | None = None):
         self.vad = vad_function
-        self.mfcc = MfccExtractor()
-        self.speaker_id = SpeakerIdentifier(b_confirm_frames=b_confirm_frames)
+        self.engine = engine
         self.speaker_oracle = speaker_oracle
         self.smoothing_window = max(1, smoothing_window)
         self.speech_segment_frames = max(1, speech_segment_frames)
         self.feature_mode = feature_mode
+
+        if engine == "neural":
+            self.embedder = WeSpeakerEmbedder()
+            self.mfcc = None
+            threshold = sim_threshold if sim_threshold is not None else NEURAL_SIM_THRESHOLD
+            self.speaker_id = SpeakerIdentifier(
+                threshold=threshold,
+                margin=0.0,
+                b_confirm_frames=b_confirm_frames,
+                min_frames_for_b=self.speech_segment_frames,
+            )
+        else:
+            self.embedder = None
+            self.mfcc = MfccExtractor()
+            threshold = sim_threshold if sim_threshold is not None else SPEAKER_SIM_THRESHOLD
+            self.speaker_id = SpeakerIdentifier(
+                threshold=threshold,
+                b_confirm_frames=b_confirm_frames,
+            )
+
         self.cmvn = CepstralNormalizer(window_size=cmvn_window) if cmvn_window > 0 else None
         self.state_machine = ConversationStateMachine()
         self.speech_buffer = []
@@ -470,14 +578,16 @@ class PipelineSimulator:
                     self.speech_buffer_start_frame = i
                 self.speech_buffer.append(frame)
                 if len(self.speech_buffer) >= self.speech_segment_frames:
+                    buf_start = self.speech_buffer_start_frame
                     speaker = self._identify_and_clear(i)
                     self.state_machine.on_speech(speaker)
-                    self._update_timeline(i, speaker)
+                    self._update_timeline(i, speaker, start_frame=buf_start)
             else:
                 if len(self.speech_buffer) >= MIN_FLUSH_FRAMES:
+                    buf_start = self.speech_buffer_start_frame
                     speaker = self._identify_and_clear(i)
                     self.state_machine.on_speech(speaker)
-                    self._update_timeline(i, speaker)
+                    self._update_timeline(i, speaker, start_frame=buf_start)
                 self.speech_buffer.clear()
                 self.state_machine.on_silence()
                 self._update_timeline(i, "silence")
@@ -501,50 +611,56 @@ class PipelineSimulator:
             self.speech_buffer.clear()
             return oracle_speaker or "A"
 
-        # Normal MFCC-based identification
-        # 1. Extract per-frame MFCCs
-        frame_mfccs = [self.mfcc.extract(f) for f in self.speech_buffer]
-        if DROP_C0:
-            frame_mfccs = [m[1:] for m in frame_mfccs]
-
         n_buffered = len(self.speech_buffer)
-        self.speech_buffer.clear()
 
-        # 2. Average static MFCCs
-        avg_static = np.mean(frame_mfccs, axis=0)
-
-        # 3. CMVN on avg_static (not on deltas — deltas are already relative)
-        if self.cmvn is not None:
-            avg_static = self.cmvn.normalize(avg_static)
-
-        # 4. Compute deltas / delta-deltas if requested
-        if self.feature_mode in ("delta", "delta+dd"):
-            n = len(frame_mfccs)
-            norm_factor = 2 * sum(k * k for k in range(1, N_DELTA + 1))  # = 10
-            deltas = []
-            for t in range(n):
-                d = np.zeros_like(frame_mfccs[0])
-                for k in range(1, N_DELTA + 1):
-                    d += k * (frame_mfccs[min(t + k, n - 1)] - frame_mfccs[max(t - k, 0)])
-                deltas.append(d / norm_factor)
-            avg_delta = np.mean(deltas, axis=0)
-
-            if self.feature_mode == "delta+dd":
-                # Delta-deltas: same regression on delta sequence
-                ddeltas = []
-                for t in range(n):
-                    dd = np.zeros_like(deltas[0])
-                    for k in range(1, N_DELTA + 1):
-                        dd += k * (deltas[min(t + k, n - 1)] - deltas[max(t - k, 0)])
-                    ddeltas.append(dd / norm_factor)
-                avg_ddelta = np.mean(ddeltas, axis=0)
-                embedding = np.concatenate([avg_static, avg_delta, avg_ddelta])
-            else:
-                embedding = np.concatenate([avg_static, avg_delta])
+        if self.engine == "neural":
+            # Neural embedding: concatenate raw audio from buffered frames → WeSpeaker
+            raw_audio = np.concatenate(self.speech_buffer)
+            self.speech_buffer.clear()
+            embedding = self.embedder.extract_embedding(raw_audio)
         else:
-            embedding = avg_static
+            # MFCC-based identification
+            # 1. Extract per-frame MFCCs
+            frame_mfccs = [self.mfcc.extract(f) for f in self.speech_buffer]
+            if DROP_C0:
+                frame_mfccs = [m[1:] for m in frame_mfccs]
+            self.speech_buffer.clear()
 
-        raw_speaker = self.speaker_id.identify(embedding)
+            # 2. Average static MFCCs
+            avg_static = np.mean(frame_mfccs, axis=0)
+
+            # 3. CMVN on avg_static (not on deltas — deltas are already relative)
+            if self.cmvn is not None:
+                avg_static = self.cmvn.normalize(avg_static)
+
+            # 4. Compute deltas / delta-deltas if requested
+            if self.feature_mode in ("delta", "delta+dd"):
+                n = len(frame_mfccs)
+                norm_factor = 2 * sum(k * k for k in range(1, N_DELTA + 1))  # = 10
+                deltas = []
+                for t in range(n):
+                    d = np.zeros_like(frame_mfccs[0])
+                    for k in range(1, N_DELTA + 1):
+                        d += k * (frame_mfccs[min(t + k, n - 1)] - frame_mfccs[max(t - k, 0)])
+                    deltas.append(d / norm_factor)
+                avg_delta = np.mean(deltas, axis=0)
+
+                if self.feature_mode == "delta+dd":
+                    # Delta-deltas: same regression on delta sequence
+                    ddeltas = []
+                    for t in range(n):
+                        dd = np.zeros_like(deltas[0])
+                        for k in range(1, N_DELTA + 1):
+                            dd += k * (deltas[min(t + k, n - 1)] - deltas[max(t - k, 0)])
+                        ddeltas.append(dd / norm_factor)
+                    avg_ddelta = np.mean(ddeltas, axis=0)
+                    embedding = np.concatenate([avg_static, avg_delta, avg_ddelta])
+                else:
+                    embedding = np.concatenate([avg_static, avg_delta])
+            else:
+                embedding = avg_static
+
+        raw_speaker = self.speaker_id.identify(embedding, n_frames=n_buffered)
 
         # Record similarity trace (raw values, before smoothing)
         sim_a = self.speaker_id.last_sim_a
@@ -571,12 +687,16 @@ class PipelineSimulator:
         self._last_smoothed_speaker = smoothed
         return smoothed
 
-    def _update_timeline(self, frame_idx, label):
-        ms = round(frame_idx * FRAME_MS)
-        if self.timeline and self.timeline[-1][2] == label:
-            self.timeline[-1] = (self.timeline[-1][0], ms + round(FRAME_MS), label)
+    def _update_timeline(self, frame_idx, label, start_frame=None):
+        if start_frame is not None:
+            start_ms = round(start_frame * FRAME_MS)
         else:
-            self.timeline.append((ms, ms + round(FRAME_MS), label))
+            start_ms = round(frame_idx * FRAME_MS)
+        end_ms = round((frame_idx + 1) * FRAME_MS)
+        if self.timeline and self.timeline[-1][2] == label:
+            self.timeline[-1] = (self.timeline[-1][0], end_ms, label)
+        else:
+            self.timeline.append((start_ms, end_ms, label))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1181,9 +1301,19 @@ def main():
                              f"(default: {DEFAULT_FEATURE_MODE})")
     parser.add_argument("--cmvn-window", type=int, default=DEFAULT_CMVN_WINDOW,
                         help=f"CMVN running window size (0=off, default: {DEFAULT_CMVN_WINDOW})")
+    parser.add_argument("--engine", choices=ENGINE_CHOICES, default=DEFAULT_ENGINE,
+                        help=f"Speaker ID engine: mfcc (v1) or neural (v2 WeSpeaker) "
+                             f"(default: {DEFAULT_ENGINE})")
+    parser.add_argument("--sim-threshold", type=float, default=None,
+                        help="Override speaker similarity threshold (default: 0.80 for mfcc, 0.50 for neural)")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON instead of table")
     args = parser.parse_args()
+
+    # Auto-adjust speech buffer for neural engine if user didn't override
+    if args.engine == "neural" and args.speech_buffer == SPEECH_SEGMENT_FRAMES:
+        args.speech_buffer = NEURAL_SEGMENT_FRAMES
+        print(f"(auto-set --speech-buffer={NEURAL_SEGMENT_FRAMES} for neural engine)")
 
     print(f"=== Audio Pipeline Validation ===\n")
     print(f"Input: {args.audio}")
@@ -1227,13 +1357,16 @@ def main():
         print("Using ground-truth speaker oracle (bypassing MFCC speaker ID)")
 
     # Run pipeline simulation
-    print(f"Running pipeline simulation ({len(audio) // FRAME_SIZE} frames)...")
+    engine_label = "neural (WeSpeaker)" if args.engine == "neural" else "MFCC"
+    print(f"Running pipeline simulation ({len(audio) // FRAME_SIZE} frames, engine={engine_label})...")
     pipeline = PipelineSimulator(vad_fn, speaker_oracle=oracle,
                                   smoothing_window=args.smoothing_window,
                                   speech_segment_frames=args.speech_buffer,
                                   b_confirm_frames=args.b_confirm_frames,
                                   feature_mode=args.feature_mode,
-                                  cmvn_window=args.cmvn_window)
+                                  cmvn_window=args.cmvn_window,
+                                  engine=args.engine,
+                                  sim_threshold=args.sim_threshold)
     pipeline_metrics = pipeline.run(audio)
 
     # Run speechbrain diarization if requested

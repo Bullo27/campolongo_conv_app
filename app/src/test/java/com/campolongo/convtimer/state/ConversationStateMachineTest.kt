@@ -361,6 +361,93 @@ class ConversationStateMachineTest {
         assertEquals(500L, snap.bfst) // all time is BFST
     }
 
+    // --- Overlap (BOTH) ---
+
+    @Test
+    fun firstSpeechBothGoesToBothTalking() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        assertEquals(ConvState.BOTH_TALKING, sm.state)
+    }
+
+    @Test
+    fun bothTalkingIncrementsBothWtaAndWtb() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        sm.onTimeTick(500)
+        val snap = sm.snapshot()
+        assertEquals(500L, snap.wta)
+        assertEquals(500L, snap.wtb)
+        assertEquals(500L, snap.ovt)
+    }
+
+    @Test
+    fun transitionFromAToBoTH() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.A)
+        sm.onTimeTick(200)
+        sm.onSpeechDetected(Speaker.BOTH)
+        assertEquals(ConvState.BOTH_TALKING, sm.state)
+        sm.onTimeTick(300)
+        val snap = sm.snapshot()
+        assertEquals(500L, snap.wta) // 200 from A + 300 from BOTH
+        assertEquals(300L, snap.wtb) // 300 from BOTH only
+        assertEquals(300L, snap.ovt)
+    }
+
+    @Test
+    fun transitionFromBothToB() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        sm.onTimeTick(100)
+        sm.onSpeechDetected(Speaker.B)
+        assertEquals(ConvState.SPEAKER_B_TALKING, sm.state)
+        sm.onTimeTick(200)
+        val snap = sm.snapshot()
+        assertEquals(100L, snap.wta) // from BOTH
+        assertEquals(300L, snap.wtb) // 100 BOTH + 200 B
+        assertEquals(100L, snap.ovt)
+    }
+
+    @Test
+    fun silenceFromBothGoesToPending() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        sm.onSilenceDetected()
+        assertEquals(ConvState.PENDING_SILENCE, sm.state)
+    }
+
+    @Test
+    fun pendingResolvedWithBothTreatedAsContinuation() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.A)
+        sm.onSilenceDetected()
+        sm.onTimeTick(100)
+        sm.onSpeechDetected(Speaker.BOTH) // BOTH after A silence → treated as A for silence resolve
+        assertEquals(ConvState.BOTH_TALKING, sm.state)
+        // Silence was between A and BOTH (treated as continuation of A) → STA
+        assertEquals(100L, sm.snapshot().sta)
+        assertEquals(0L, sm.snapshot().stm)
+    }
+
+    @Test
+    fun sameBothSpeechStaysInBothTalking() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        sm.onSpeechDetected(Speaker.BOTH) // repeated BOTH
+        assertEquals(ConvState.BOTH_TALKING, sm.state)
+    }
+
+    @Test
+    fun pauseFromBothTalkingRestores() {
+        sm.onRecord()
+        sm.onSpeechDetected(Speaker.BOTH)
+        sm.onPause()
+        assertEquals(ConvState.PAUSED, sm.state)
+        sm.onResume()
+        assertEquals(ConvState.BOTH_TALKING, sm.state)
+    }
+
     // --- Full conversation scenario ---
 
     @Test

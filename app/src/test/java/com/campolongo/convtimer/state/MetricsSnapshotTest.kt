@@ -22,6 +22,7 @@ class MetricsSnapshotTest {
         assertEquals(0L, snap.sta)
         assertEquals(0L, snap.stb)
         assertEquals(0L, snap.stm)
+        assertEquals(0L, snap.ovt)
         assertEquals(0L, snap.cta)
         assertEquals(0L, snap.ctb)
         assertEquals(0L, snap.tct)
@@ -109,6 +110,26 @@ class MetricsSnapshotTest {
     }
 
     @Test
+    fun addOvtAccumulatesCorrectly() {
+        acc.addOvt(100)
+        acc.addOvt(50)
+        assertEquals(150L, acc.snapshot().ovt)
+    }
+
+    @Test
+    fun overlapTrackedIndependently() {
+        // During overlap, WTA and WTB both get credited for the same time.
+        // OVT tracks the overlap amount separately.
+        acc.addWta(500)  // 300 solo A + 200 overlap
+        acc.addWtb(400)  // 200 solo B + 200 overlap
+        acc.addOvt(200)
+        val snap = acc.snapshot()
+        assertEquals(200L, snap.ovt)
+        // Unique speech time = WTA + WTB - OVT = 700
+        assertEquals(700L, snap.wta + snap.wtb - snap.ovt)
+    }
+
+    @Test
     fun resetZeroesEverything() {
         acc.addTrt(1000)
         acc.addWta(100)
@@ -116,6 +137,7 @@ class MetricsSnapshotTest {
         acc.addSta(30)
         acc.addStb(40)
         acc.addStm(50)
+        acc.addOvt(60)
         acc.reset()
         val snap = acc.snapshot()
         assertEquals(0L, snap.trt)
@@ -124,6 +146,7 @@ class MetricsSnapshotTest {
         assertEquals(0L, snap.sta)
         assertEquals(0L, snap.stb)
         assertEquals(0L, snap.stm)
+        assertEquals(0L, snap.ovt)
     }
 
     @Test

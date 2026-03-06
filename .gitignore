@@ -27,3 +27,7 @@ __pycache__/
 
 # ONNX model (too large for git)
 models/
+
+# Release signing key
+*.keystore
+*.jks

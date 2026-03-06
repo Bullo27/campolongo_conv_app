@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -16,13 +18,28 @@ android {
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            val props = Properties()
+            val localPropsFile = rootProject.file("local.properties")
+            if (localPropsFile.exists()) {
+                props.load(localPropsFile.inputStream())
+            }
+            storeFile = file(props.getProperty("RELEASE_STORE_FILE", ""))
+            storePassword = props.getProperty("RELEASE_STORE_PASSWORD", "")
+            keyAlias = props.getProperty("RELEASE_KEY_ALIAS", "")
+            keyPassword = props.getProperty("RELEASE_KEY_PASSWORD", "")
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -65,6 +82,7 @@ dependencies {
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.android.vad.silero)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.onnxruntime.android)
 
     debugImplementation(libs.compose.ui.tooling)
 

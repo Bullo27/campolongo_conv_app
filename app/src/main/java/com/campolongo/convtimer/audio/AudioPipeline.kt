@@ -10,10 +10,14 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import java.io.Closeable
+import kotlin.math.min
 
 /**
  * Orchestrates the audio processing pipeline:
- * AudioCapture -> VAD -> MFCC -> SpeakerIdentifier -> Events
+ * AudioCapture -> VAD -> Fbank+ONNX -> SpeakerIdentifier -> Dual-assignment -> Events
+ *
+ * v2 neural pipeline: WeSpeaker ECAPA-TDNN-512 ONNX embeddings (192-dim),
+ * dual-assignment overlap detection, adaptive noise tier selection.
  */
 class AudioPipeline(
     private val scope: CoroutineScope,
@@ -21,16 +25,30 @@ class AudioPipeline(
 
     companion object {
         private const val TAG = "AudioPipeline"
-        private const val SPEECH_SEGMENT_FRAMES = 8 // ~256ms of speech before speaker ID
-        private const val MFCC_COEFFS = 13
-        private const val SMOOTHING_WINDOW = 6 // majority-vote over recent decisions
+
+        // Pipeline buffering
+        private const val SPEECH_SEGMENT_FRAMES = 47  // ~1.5s of speech before speaker ID
+        private const val MIN_FLUSH_FRAMES = 2        // min buffer to flush on silence
+
+        // Dual-assignment overlap
+        private const val DUAL_CAP = 3                // max consecutive dual-assignment segments
+        private const val DUAL_T_LOW_NOISE = 0.82f    // Low Noise mode threshold
+        private const val DUAL_T_ADAPTIVE_DEFAULT = 0.84f  // Adaptive Noise default
+        private const val DUAL_T_HIGH = 1.0f          // High noise = overlap disabled
+
+        // Adaptive noise EMA constants (only active in ADAPTIVE_NOISE mode)
+        private const val ADAPTIVE_ALPHA = 0.0645f    // = 2/(30+1), N=30
+        private const val NOISE_T_HIGH = 0.78f        // EMA threshold for HIGH tier
+        private const val NOISE_MARGIN = 0.025f       // hysteresis band
+        private const val NOISE_MIN_DWELL = 5         // min segments between tier changes
+        private const val NOISE_WARMUP = 15           // segments after B before tier logic
     }
 
     private val audioCapture = AudioCaptureService()
     private val vadEngine = VadEngine()
-    private val mfccExtractor = MfccExtractor()
     private val speakerIdentifier = SpeakerIdentifier()
     private val noiseCalibrator = NoiseCalibrator()
+    private var onnxExtractor: OnnxEmbeddingExtractor? = null
 
     private val _events = MutableSharedFlow<AudioPipelineEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<AudioPipelineEvent> = _events
@@ -39,9 +57,19 @@ class AudioPipeline(
     private var processingJob: Job? = null
     private val speechBuffer = mutableListOf<ShortArray>()
 
-    // Smoothing: majority-vote over recent raw speaker decisions
-    private val decisionBuffer = ArrayDeque<Speaker>(SMOOTHING_WINDOW)
-    private var lastSmoothedSpeaker = Speaker.A
+    // Overlap mode (user-selectable)
+    var overlapMode: OverlapMode = OverlapMode.LOW_NOISE
+        private set
+
+    // Dual-assignment state
+    private var consecDual = 0
+
+    // Adaptive noise state
+    private var noiseEma = 0f
+    private var segsSinceTierChange = NOISE_MIN_DWELL  // allow immediate first transition
+    private var currentTier = AdaptiveTier.LOW
+    private var bEstablished = false
+    private var segsSinceB = 0
 
     var noiseLevel: NoiseLevel = NoiseLevel.QUIET
         private set
@@ -52,13 +80,13 @@ class AudioPipeline(
             return false
         }
         vadEngine.initialize(context)
+        onnxExtractor = OnnxEmbeddingExtractor(context)
+        Log.d(TAG, "ONNX embedding extractor initialized")
         return true
     }
 
     /**
      * Calibrate noise level by capturing ambient audio for ~1.5 seconds.
-     * Reuses the main AudioCaptureService to avoid device-specific issues
-     * with concurrent AudioRecord instances.
      */
     suspend fun calibrateNoise(context: Context): NoiseLevel {
         val frames = mutableListOf<ShortArray>()
@@ -94,10 +122,16 @@ class AudioPipeline(
         Log.d(TAG, "Noise level manually set to: ${level.label}")
     }
 
+    fun setOverlapMode(mode: OverlapMode) {
+        overlapMode = mode
+        resetAdaptiveState()
+        Log.d(TAG, "Overlap mode set to: $mode")
+    }
+
     fun start() {
         speakerIdentifier.reset()
-        decisionBuffer.clear()
-        lastSmoothedSpeaker = Speaker.A
+        consecDual = 0
+        resetAdaptiveState()
         launchPipelineJobs()
         Log.d(TAG, "Pipeline started")
     }
@@ -115,6 +149,15 @@ class AudioPipeline(
     fun stop() {
         stopPipelineJobs()
         Log.d(TAG, "Pipeline stopped")
+    }
+
+    private fun resetAdaptiveState() {
+        noiseEma = 0f
+        segsSinceTierChange = NOISE_MIN_DWELL
+        currentTier = AdaptiveTier.LOW
+        bEstablished = false
+        segsSinceB = 0
+        consecDual = 0
     }
 
     private fun launchPipelineJobs() {
@@ -135,8 +178,6 @@ class AudioPipeline(
         captureJob?.cancel()
         processingJob?.cancel()
         audioCapture.pauseCapturing()
-        // Don't clear speechBuffer here — avoids race with IO thread.
-        // It is cleared in launchPipelineJobs() before restarting.
     }
 
     private suspend fun processFrame(frame: ShortArray) {
@@ -149,7 +190,7 @@ class AudioPipeline(
             }
         } else {
             // Flush any accumulated speech
-            if (speechBuffer.size >= 2) {
+            if (speechBuffer.size >= MIN_FLUSH_FRAMES) {
                 identifyAndEmit()
             }
             speechBuffer.clear()
@@ -158,54 +199,103 @@ class AudioPipeline(
     }
 
     private suspend fun identifyAndEmit() {
-        // Compute MFCCs per frame and average — uses all buffered audio
-        val avgMfcc = FloatArray(MFCC_COEFFS)
-        for (frame in speechBuffer) {
-            val frameMfcc = mfccExtractor.extract(frame)
-            for (i in avgMfcc.indices) {
-                avgMfcc[i] += frameMfcc[i]
-            }
-        }
-        val count = speechBuffer.size
+        val extractor = onnxExtractor ?: return
+
+        // 1. Concatenate speech buffer into single audio segment
+        val nFrames = speechBuffer.size
+        val rawAudio = concatenateBuffer(speechBuffer)
         speechBuffer.clear()
 
-        if (count > 0) {
-            for (i in avgMfcc.indices) {
-                avgMfcc[i] /= count
+        // 2. Extract neural embedding
+        val embedding = extractor.extractEmbedding(rawAudio)
+
+        // 3. Identify primary speaker
+        val primarySpeaker = speakerIdentifier.identify(embedding, nFrames)
+
+        // 4. Get similarities for dual-assignment & adaptive noise
+        val simA = speakerIdentifier.lastSimA
+        val simB = speakerIdentifier.lastSimB
+
+        // 5. Adaptive noise tier update (only in ADAPTIVE_NOISE mode)
+        if (overlapMode == OverlapMode.ADAPTIVE_NOISE) {
+            updateNoiseTier(simA, simB)
+        }
+
+        // 6. Dual-assignment overlap check
+        val dualT = when (overlapMode) {
+            OverlapMode.LOW_NOISE -> DUAL_T_LOW_NOISE
+            OverlapMode.ADAPTIVE_NOISE -> when (currentTier) {
+                AdaptiveTier.HIGH -> DUAL_T_HIGH
+                AdaptiveTier.LOW -> DUAL_T_ADAPTIVE_DEFAULT
             }
         }
+        val bothAbove = simA >= dualT && simB >= dualT
+        val isDual = bothAbove && consecDual < DUAL_CAP
 
-        // Drop C0 (log energy) — it dominates cosine similarity and
-        // masks the spectral-shape coefficients that distinguish speakers.
-        val embedding = avgMfcc.copyOfRange(1, MFCC_COEFFS)
-        val rawSpeaker = speakerIdentifier.identify(embedding)
-
-        // Majority-vote smoothing over recent decisions
-        if (decisionBuffer.size >= SMOOTHING_WINDOW) {
-            decisionBuffer.removeFirst()
-        }
-        decisionBuffer.addLast(rawSpeaker)
-
-        val smoothed = if (SMOOTHING_WINDOW <= 1) {
-            rawSpeaker
+        if (isDual) {
+            consecDual++
+            _events.emit(AudioPipelineEvent.SpeechDetected(Speaker.BOTH))
         } else {
-            val countA = decisionBuffer.count { it == Speaker.A }
-            val countB = decisionBuffer.size - countA
-            when {
-                countA > countB -> Speaker.A
-                countB > countA -> Speaker.B
-                else -> lastSmoothedSpeaker // tie → keep previous
-            }
+            if (!bothAbove) consecDual = 0
+            // No smoothing (window=1): emit primary directly
+            _events.emit(AudioPipelineEvent.SpeechDetected(primarySpeaker))
         }
-        lastSmoothedSpeaker = smoothed
+    }
 
-        _events.emit(AudioPipelineEvent.SpeechDetected(smoothed))
+    private fun updateNoiseTier(simA: Float, simB: Float) {
+        // Only start after B established
+        if (!bEstablished) {
+            if (simB > 0f && speakerIdentifier.isBEstablished) {
+                bEstablished = true
+                noiseEma = min(simA, simB)
+            }
+            return
+        }
+
+        // EMA update
+        noiseEma = ADAPTIVE_ALPHA * min(simA, simB) + (1f - ADAPTIVE_ALPHA) * noiseEma
+
+        // Warmup: skip tier decisions
+        segsSinceB++
+        if (segsSinceB < NOISE_WARMUP) return
+
+        // Tier decision with hysteresis + min dwell
+        segsSinceTierChange++
+        if (segsSinceTierChange < NOISE_MIN_DWELL) return
+
+        val newTier = when {
+            currentTier != AdaptiveTier.HIGH && noiseEma > NOISE_T_HIGH + NOISE_MARGIN ->
+                AdaptiveTier.HIGH
+            currentTier == AdaptiveTier.HIGH && noiseEma < NOISE_T_HIGH - NOISE_MARGIN ->
+                AdaptiveTier.LOW
+            else -> currentTier
+        }
+        if (newTier != currentTier) {
+            Log.d(TAG, "Noise tier: $currentTier -> $newTier (ema=%.4f)".format(noiseEma))
+            currentTier = newTier
+            segsSinceTierChange = 0
+        }
+    }
+
+    private fun concatenateBuffer(buffer: List<ShortArray>): ShortArray {
+        val total = buffer.sumOf { it.size }
+        val result = ShortArray(total)
+        var offset = 0
+        for (frame in buffer) {
+            frame.copyInto(result, offset)
+            offset += frame.size
+        }
+        return result
     }
 
     override fun close() {
         stop()
         audioCapture.close()
         vadEngine.close()
+        onnxExtractor?.close()
         Log.d(TAG, "AudioPipeline closed")
     }
+
+    /** Internal adaptive noise tier. */
+    private enum class AdaptiveTier { LOW, HIGH }
 }

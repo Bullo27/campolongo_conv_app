@@ -27,11 +27,20 @@ def main():
     )
 
     if result.returncode == 0:
-        apk_dir = PROJECT_ROOT / "app" / "build" / "outputs" / "apk" / "debug"
+        # Determine output directory based on build type
+        if "Release" in build_type or "release" in build_type:
+            variant = "release"
+        else:
+            variant = "debug"
+
+        apk_dir = PROJECT_ROOT / "app" / "build" / "outputs" / "apk" / variant
         if apk_dir.exists():
             apks = list(apk_dir.glob("*.apk"))
             if apks:
-                print(f"\nAPK built: {apks[0]}")
+                apk = apks[0]
+                size_mb = apk.stat().st_size / (1024 * 1024)
+                print(f"\nAPK built: {apk}")
+                print(f"APK size: {size_mb:.1f} MB")
     else:
         print("Build failed!", file=sys.stderr)
         sys.exit(1)

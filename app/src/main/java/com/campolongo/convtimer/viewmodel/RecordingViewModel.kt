@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.campolongo.convtimer.audio.AudioPipeline
 import com.campolongo.convtimer.audio.AudioPipelineEvent
 import com.campolongo.convtimer.audio.NoiseLevel
+import com.campolongo.convtimer.audio.OverlapMode
 import com.campolongo.convtimer.state.ConversationStateMachine
 import com.campolongo.convtimer.state.MetricsSnapshot
 import kotlinx.coroutines.Job
@@ -25,6 +26,7 @@ data class UiState(
     val recordingState: RecordingState = RecordingState.IDLE,
     val metrics: MetricsSnapshot = MetricsSnapshot(),
     val noiseLevel: NoiseLevel = NoiseLevel.QUIET,
+    val overlapMode: OverlapMode = OverlapMode.LOW_NOISE,
     val permissionNeeded: Boolean = false,
 )
 
@@ -122,6 +124,11 @@ class RecordingViewModel(application: Application) : AndroidViewModel(applicatio
         val context = getApplication<Application>()
         pipeline.setNoiseLevel(context, level)
         _uiState.value = _uiState.value.copy(noiseLevel = level)
+    }
+
+    fun onOverlapMode(mode: OverlapMode) {
+        pipeline.setOverlapMode(mode)
+        _uiState.value = _uiState.value.copy(overlapMode = mode)
     }
 
     private fun startEventCollection() {

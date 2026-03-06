@@ -7,6 +7,7 @@ enum class ConvState {
     INITIAL_SILENCE,
     SPEAKER_A_TALKING,
     SPEAKER_B_TALKING,
+    BOTH_TALKING,
     PENDING_SILENCE,
     PAUSED,
     STOPPED,
@@ -68,9 +69,6 @@ class ConversationStateMachine {
 
     fun onStop() {
         if (state != ConvState.IDLE && state != ConvState.STOPPED) {
-            // Pending silence is left unresolved — it's already counted in TRT
-            // but not in any conversation metric, so it falls into BFST (= TRT - TCT)
-            // as final silence, which is the correct semantic.
             pendingSilenceMs = 0L
             pendingSilenceLastSpeaker = null
             state = ConvState.STOPPED
@@ -81,30 +79,26 @@ class ConversationStateMachine {
 
     fun onSpeechDetected(speaker: Speaker) {
         when (state) {
-            ConvState.INITIAL_SILENCE -> {
-                // First speech — transition to speaking state
-                state = if (speaker == Speaker.A) ConvState.SPEAKER_A_TALKING else ConvState.SPEAKER_B_TALKING
-                lastActiveSpeaker = speaker
-            }
-            ConvState.SPEAKER_A_TALKING -> {
-                if (speaker == Speaker.B) {
-                    // Direct speaker change (no silence gap)
-                    state = ConvState.SPEAKER_B_TALKING
-                    lastActiveSpeaker = Speaker.B
-                }
-                // If still Speaker A, stay in SPEAKER_A_TALKING
-            }
-            ConvState.SPEAKER_B_TALKING -> {
-                if (speaker == Speaker.A) {
-                    state = ConvState.SPEAKER_A_TALKING
-                    lastActiveSpeaker = Speaker.A
+            ConvState.INITIAL_SILENCE,
+            ConvState.SPEAKER_A_TALKING,
+            ConvState.SPEAKER_B_TALKING,
+            ConvState.BOTH_TALKING -> {
+                val newState = speakerToState(speaker)
+                if (newState != state) {
+                    state = newState
+                    lastActiveSpeaker = primarySpeaker(speaker)
                 }
             }
             ConvState.PENDING_SILENCE -> {
-                // Resolve pending silence
-                resolvePendingSilence(speaker)
-                state = if (speaker == Speaker.A) ConvState.SPEAKER_A_TALKING else ConvState.SPEAKER_B_TALKING
-                lastActiveSpeaker = speaker
+                // For silence classification, treat BOTH as continuation of lastActiveSpeaker
+                val resolveAs = if (speaker == Speaker.BOTH) {
+                    lastActiveSpeaker ?: Speaker.A
+                } else {
+                    speaker
+                }
+                resolvePendingSilence(resolveAs)
+                state = speakerToState(speaker)
+                lastActiveSpeaker = primarySpeaker(speaker)
             }
             else -> {} // Ignore in IDLE, PAUSED, STOPPED
         }
@@ -112,7 +106,7 @@ class ConversationStateMachine {
 
     fun onSilenceDetected() {
         when (state) {
-            ConvState.SPEAKER_A_TALKING, ConvState.SPEAKER_B_TALKING -> {
+            ConvState.SPEAKER_A_TALKING, ConvState.SPEAKER_B_TALKING, ConvState.BOTH_TALKING -> {
                 pendingSilenceLastSpeaker = lastActiveSpeaker
                 pendingSilenceMs = 0L
                 state = ConvState.PENDING_SILENCE
@@ -140,6 +134,12 @@ class ConversationStateMachine {
             ConvState.SPEAKER_B_TALKING -> {
                 metrics.addWtb(dtMs)
             }
+            ConvState.BOTH_TALKING -> {
+                // During overlap, credit both speakers + track overlap separately
+                metrics.addWta(dtMs)
+                metrics.addWtb(dtMs)
+                metrics.addOvt(dtMs)
+            }
             ConvState.PENDING_SILENCE -> {
                 pendingSilenceMs += dtMs
             }
@@ -156,6 +156,7 @@ class ConversationStateMachine {
             when (prevSpeaker) {
                 Speaker.A -> metrics.addSta(ms)
                 Speaker.B -> metrics.addStb(ms)
+                Speaker.BOTH -> metrics.addStm(ms) // shouldn't normally happen
             }
         } else {
             // Between-speaker silence
@@ -164,5 +165,17 @@ class ConversationStateMachine {
 
         pendingSilenceMs = 0L
         pendingSilenceLastSpeaker = null
+    }
+
+    private fun speakerToState(speaker: Speaker): ConvState = when (speaker) {
+        Speaker.A -> ConvState.SPEAKER_A_TALKING
+        Speaker.B -> ConvState.SPEAKER_B_TALKING
+        Speaker.BOTH -> ConvState.BOTH_TALKING
+    }
+
+    /** For lastActiveSpeaker tracking, BOTH keeps the previous speaker. */
+    private fun primarySpeaker(speaker: Speaker): Speaker = when (speaker) {
+        Speaker.BOTH -> lastActiveSpeaker ?: Speaker.A
+        else -> speaker
     }
 }

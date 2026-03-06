@@ -29,6 +29,7 @@ private val metricDefs = listOf(
     MetricDef("STM", "Silence time between\nspeaker A and speaker B") { it.stm },
     MetricDef("TST", "Total silence time\n= STA+STB+STM") { it.tst },
     MetricDef("BFST", "Beginning and final\nsilence time = TRT-TCT") { it.bfst },
+    MetricDef("OVT", "Overlap time\n(both speaking)") { it.ovt },
 )
 
 @Composable

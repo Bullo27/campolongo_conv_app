@@ -7,6 +7,7 @@ data class MetricsSnapshot(
     val sta: Long = 0L,
     val stb: Long = 0L,
     val stm: Long = 0L,
+    val ovt: Long = 0L,
 ) {
     val cta: Long get() = wta + sta
     val ctb: Long get() = wtb + stb
@@ -26,6 +27,7 @@ class MetricsAccumulator {
     private var _sta = 0L
     private var _stb = 0L
     private var _stm = 0L
+    private var _ovt = 0L
 
     fun addTrt(dt: Long) { _trt += dt }
     fun addWta(dt: Long) { _wta += dt }
@@ -33,6 +35,7 @@ class MetricsAccumulator {
     fun addSta(dt: Long) { _sta += dt }
     fun addStb(dt: Long) { _stb += dt }
     fun addStm(dt: Long) { _stm += dt }
+    fun addOvt(dt: Long) { _ovt += dt }
 
     fun snapshot(): MetricsSnapshot = MetricsSnapshot(
         trt = _trt,
@@ -41,6 +44,7 @@ class MetricsAccumulator {
         sta = _sta,
         stb = _stb,
         stm = _stm,
+        ovt = _ovt,
     )
 
     fun reset() {
@@ -50,5 +54,6 @@ class MetricsAccumulator {
         _sta = 0L
         _stb = 0L
         _stm = 0L
+        _ovt = 0L
     }
 }
